@@ -1,255 +1,288 @@
 """
-Train final localization model (700 UE) and save artifacts for main.py.
+Train v30 model on provided 700 UE and save model_mlp.pt for main.py.
 
-Picks best version from outputs/version_catalog.json unless --version set.
+Uses same core types as main.py (import main) for report/train consistency.
 """
 from __future__ import annotations
 
 import argparse
-import json
-import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import scipy.io as sio
+from sklearn.isotonic import IsotonicRegression
+from sklearn.model_selection import KFold
 
-ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+import main as M
 
-from lib.cv import (
-    fit_full_and_predict,
-    run_fold_cv,
-    tune_asym_pos_weight,
-    tune_huber_f_scale,
-    tune_pos_blend_weight,
-    tune_quantile_tau,
-    tune_top_k,
-    tune_weight_gamma,
-)
-from lib.io_mat import load_dataset, project_root
-from lib.pipeline import VERSION_REGISTRY, PipelineConfig
-
+Array = np.ndarray
+CV_SEED = 42
+N_SPLITS = 5
 PRODUCTION_VERSION = "v30"
 
 
-def _pick_best_from_catalog() -> str:
-    cat_path = project_root() / "outputs" / "version_catalog.json"
-    if not cat_path.exists():
-        return PRODUCTION_VERSION
-    cat = json.loads(cat_path.read_text(encoding="utf-8"))
-    if "best" in cat:
-        return cat["best"]["version"]
-    rows = cat.get("versions", [])
-    if not rows:
-        return PRODUCTION_VERSION
-    # exclude deprecated gate versions from auto-pick
-    rows = [r for r in rows if r.get("version") != "v04" and not r.get("gate")]
-    if not rows:
-        return PRODUCTION_VERSION
-    return min(rows, key=lambda r: r["cv_rmse_m"])["version"]
-
-
-def _resolve_config(version: str, d_hat, p, bs) -> tuple[PipelineConfig, dict | None]:
-    cfg = VERSION_REGISTRY[version]
-    extra = None
-    if version in ("v09", "v10"):
-        tune = tune_huber_f_scale(d_hat, p, bs, cfg)
-        cfg = PipelineConfig(
-            version=version,
-            loss=cfg.loss,
-            huber_f_scale=tune["best_huber_f_scale"],
-            calib=cfg.calib,
-            gate=False,
-            description=cfg.description,
-        )
-        extra = {"f_scale_tuning": tune}
-    elif version == "v11":
-        tune = tune_weight_gamma(d_hat, p, bs, cfg)
-        cfg = PipelineConfig(
-            version="v11",
-            loss=cfg.loss,
-            huber_f_scale=cfg.huber_f_scale,
-            calib=cfg.calib,
-            gate=False,
-            weight_gamma=tune["best_weight_gamma"],
-            description=cfg.description,
-        )
-        extra = {"weight_tuning": tune}
-    elif version == "v14":
-        tune = tune_asym_pos_weight(d_hat, p, bs, cfg)
-        cfg = PipelineConfig(
-            version="v14",
-            loss=cfg.loss,
-            calib=cfg.calib,
-            asym_pos_weight=tune["best_asym_pos_weight"],
-            description=cfg.description,
-        )
-        extra = {"asym_tuning": tune}
-    elif version == "v15":
-        tune = tune_top_k(d_hat, p, bs, cfg)
-        cfg = PipelineConfig(
-            version="v15",
-            loss=cfg.loss,
-            calib=cfg.calib,
-            top_k=tune["best_top_k"],
-            description=cfg.description,
-        )
-        extra = {"top_k_tuning": tune}
-    elif version == "v17":
-        tune = tune_weight_gamma(d_hat, p, bs, cfg)
-        cfg = PipelineConfig(
-            version="v17",
-            loss=cfg.loss,
-            calib=cfg.calib,
-            weight_gamma=tune["best_weight_gamma"],
-            description=cfg.description,
-        )
-        extra = {"weight_tuning": tune}
-    elif version == "v20":
-        tune = tune_pos_blend_weight(d_hat, p, bs, cfg)
-        cfg = PipelineConfig(
-            version="v20",
-            loss=cfg.loss,
-            calib=cfg.calib,
-            pos_blend_weight=tune["best_pos_blend_weight"],
-            description=cfg.description,
-        )
-        extra = {"blend_tuning": tune}
-    elif version in ("v25", "v26"):
-        cfg = VERSION_REGISTRY[version]
-        if version == "v25":
-            cfg = PipelineConfig(
-                version="v25",
-                calib="isotonic_mlp",
-                weight_gamma=1.0,
-                pos_refine_affine=True,
-            )
-        else:
-            cfg = PipelineConfig(
-                version="v26",
-                calib="isotonic_mlp_far2",
-                weight_gamma=1.0,
-            )
-    elif version == "v30":
-        cfg = VERSION_REGISTRY["v30"]
-    elif version == "v27":
-        tune = tune_quantile_tau(d_hat, p, bs, VERSION_REGISTRY["v27"])
-        cfg = PipelineConfig(
-            version="v27",
-            calib="quantile_mlp",
-            weight_gamma=1.0,
-            quantile_tau=tune["best_quantile_tau"],
-        )
-        extra = {"tau_tuning": tune}
-    return cfg, extra
-
-
-def _save_pos_pt(path: Path, calib) -> None:
-    if calib.pos_bundle is None:
-        return
-    import torch
-    from lib.pos_mlp import bundle_to_dict
-
-    torch.save(
-        {"state_dict": calib.pos_bundle.state_dict, "meta": bundle_to_dict(calib.pos_bundle)},
-        path,
+def _fit_isotonic_1d(x: Array, y: Array) -> tuple[Array, Array]:
+    ir = IsotonicRegression(out_of_bounds="clip")
+    x = np.asarray(x, dtype=np.float64).ravel()
+    y = np.asarray(y, dtype=np.float64).ravel()
+    ir.fit(x, y)
+    return (
+        np.asarray(ir.X_thresholds_, dtype=np.float64),
+        np.asarray(ir.y_thresholds_, dtype=np.float64),
     )
 
 
-def _save_mlp_pt(path: Path, calib) -> None:
-    if calib.mlp_bundle is None:
-        return
-    import torch
-    from lib.mlp_calib import bundle_to_dict
+def fit_isotonic_per_bs(d_hat: Array, p: Array, bs: Array, train_idx: Array) -> tuple[list, list]:
+    d_true = M.geometric_distances(p[:, train_idx], bs)
+    dh = d_hat[:, train_idx]
+    iso_x, iso_y = [], []
+    for k in range(18):
+        xk, yk = _fit_isotonic_1d(dh[k], d_true[k])
+        iso_x.append(xk)
+        iso_y.append(yk)
+    return iso_x, iso_y
 
+
+def fit_mlp_on_iso(
+    d_hat: Array,
+    p: Array,
+    bs: Array,
+    train_idx: Array,
+    iso_x: list,
+    iso_y: list,
+    *,
+    epochs: int = 100,
+) -> M.MLPBundle:
+    d_true = M.geometric_distances(p[:, train_idx], bs)
+    rows, targets = [], []
+    for j, u in enumerate(train_idx):
+        d = np.asarray(d_hat[:, int(u)], dtype=np.float64)
+        iso = np.empty(18, dtype=np.float64)
+        for k in range(18):
+            xk = np.asarray(iso_x[k], dtype=np.float64)
+            yk = np.asarray(iso_y[k], dtype=np.float64)
+            iso[k] = np.interp(d[k], xk, yk, left=yk[0], right=yk[-1])
+        rows.append(iso)
+        targets.append(d_true[:, j])
+    dh = np.stack(rows, axis=1).T
+    y = np.stack(targets, axis=1).T
+    in_mean = dh.mean(axis=0)
+    in_std = np.maximum(dh.std(axis=0), 1e-3)
+    return _fit_mlp_arrays(dh, y, in_mean, in_std, epochs=epochs)
+
+
+def _fit_mlp_arrays(
+    dh: Array,
+    y: Array,
+    in_mean: Array,
+    in_std: Array,
+    *,
+    epochs: int = 100,
+    lr: float = 1e-3,
+    hidden: int = 64,
+    dropout: float = 0.25,
+    seed: int = 42,
+) -> M.MLPBundle:
+    import torch
+    import torch.nn as nn
+
+    torch.manual_seed(seed)
+    model = M.DistMLP(hidden, dropout)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    xn = (dh - in_mean) / in_std
+    xt = torch.from_numpy(xn.astype(np.float32))
+    yt = torch.from_numpy(y.astype(np.float32))
+    t_std = torch.from_numpy(in_std.astype(np.float32))
+    t_mean = torch.from_numpy(in_mean.astype(np.float32))
+    model.train()
+    for _ in range(epochs):
+        opt.zero_grad()
+        pred = model(xt) * t_std + t_mean
+        loss = nn.functional.mse_loss(pred, yt)
+        loss.backward()
+        opt.step()
+    return M.MLPBundle(
+        state_dict=model.state_dict(),
+        in_mean=in_mean,
+        in_std=in_std,
+        hidden=hidden,
+        dropout=dropout,
+    )
+
+
+def fit_pos_affine(p_hat: Array, p_true: Array) -> Array:
+    n = p_hat.shape[1]
+    X = np.column_stack([p_hat[0], p_hat[1], np.ones(n, dtype=np.float64)])
+    coef, *_ = np.linalg.lstsq(X, p_true.T, rcond=None)
+    return np.asarray(coef.T, dtype=np.float64)
+
+
+def fit_calib_v30(d_hat: Array, p: Array, bs: Array, train_idx: Array) -> M.CalibParams:
+    iso_x, iso_y = fit_isotonic_per_bs(d_hat, p, bs, train_idx)
+    bundle = fit_mlp_on_iso(d_hat, p, bs, train_idx, iso_x, iso_y)
+    return M.CalibParams("isotonic_mlp", iso_x=iso_x, iso_y=iso_y, mlp_bundle=bundle)
+
+
+def v30_pipeline_cfg() -> M.PipelineConfig:
+    return M.PipelineConfig(
+        huber_f_scale=1.0,
+        weight_gamma=1.0,
+        asym_pos_weight=5.0,
+        pos_refine_affine=True,
+    )
+
+
+def fit_affine_on_train(
+    d_hat: Array,
+    p: Array,
+    bs: Array,
+    train_idx: Array,
+    calib: M.CalibParams,
+    cfg: M.PipelineConfig,
+) -> M.CalibParams:
+    cfg_no = replace(cfg, pos_refine_affine=False)
+    p_tr = np.zeros((2, len(train_idx)), dtype=np.float64)
+    for j, u in enumerate(train_idx):
+        p_tr[:, j] = M.localize_user(d_hat[:, int(u)], bs, calib, cfg_no)
+    calib.pos_affine = fit_pos_affine(p_tr, p[:, train_idx])
+    return calib
+
+
+def run_fold_cv(d_hat: Array, p: Array, bs: Array, cfg: M.PipelineConfig) -> dict:
+    n = d_hat.shape[1]
+    kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=CV_SEED)
+    oof_err = np.full(n, np.nan)
+    fold_rows = []
+
+    for fold_id, (tr, va) in enumerate(kf.split(np.arange(n))):
+        train_idx = np.asarray(tr, dtype=np.int64)
+        val_idx = np.asarray(va, dtype=np.int64)
+        calib = fit_calib_v30(d_hat, p, bs, train_idx)
+        calib = fit_affine_on_train(d_hat, p, bs, train_idx, calib, cfg)
+        preds = np.zeros((2, len(val_idx)))
+        for j, u in enumerate(val_idx):
+            preds[:, j] = M.localize_user(d_hat[:, int(u)], bs, calib, cfg)
+        err = np.hypot(p[0, val_idx] - preds[0], p[1, val_idx] - preds[1])
+        oof_err[val_idx] = err
+        fold_rows.append(
+            {
+                "fold": fold_id,
+                "n_train": len(train_idx),
+                "n_val": len(val_idx),
+                "val_rmse_m": float(np.sqrt(np.mean(err**2))),
+            }
+        )
+
+    err_all = oof_err[~np.isnan(oof_err)]
+    return {
+        "oof_position": {
+            "rmse_m": float(np.sqrt(np.mean(err_all**2))),
+            "median_m": float(np.median(err_all)),
+            "p90_m": float(np.percentile(err_all, 90)),
+            "n": int(err_all.size),
+        },
+        "folds": fold_rows,
+    }
+
+
+def calib_to_dict(calib: M.CalibParams) -> dict:
+    d: dict = {
+        "mode": calib.mode,
+        "iso_x": [np.asarray(x).tolist() for x in calib.iso_x],
+        "iso_y": [np.asarray(y).tolist() for y in calib.iso_y],
+    }
+    if calib.pos_affine is not None:
+        d["pos_affine"] = np.asarray(calib.pos_affine).tolist()
+    return d
+
+
+def save_model_bundle(
+    path: Path,
+    calib: M.CalibParams,
+    cfg: M.PipelineConfig,
+    *,
+    state_dict: dict,
+    meta: dict,
+) -> None:
+    import torch
+
+    assert calib.mlp_bundle is not None
     torch.save(
         {
-            "state_dict": calib.mlp_bundle.state_dict,
-            "meta": bundle_to_dict(calib.mlp_bundle),
+            "state_dict": state_dict,
+            "meta": meta,
+            "production_version": PRODUCTION_VERSION,
+            "pipeline": {
+                "loss": cfg.loss,
+                "huber_f_scale": cfg.huber_f_scale,
+                "calib": "isotonic_mlp",
+                "weight_gamma": cfg.weight_gamma,
+                "asym_pos_weight": cfg.asym_pos_weight,
+                "pos_refine_affine": cfg.pos_refine_affine,
+            },
+            "calib": calib_to_dict(calib),
         },
         path,
     )
 
 
-def _save_calib_npz(path: Path, calib) -> None:
-    payload = {"mode": calib.mode}
-    if calib.quad is not None:
-        payload["quad"] = np.asarray(calib.quad)
-    if calib.mode in ("global_affine", "per_bs_affine"):
-        payload["alpha"] = np.asarray(calib.alpha)
-        payload["beta"] = np.asarray(calib.beta)
-    if calib.iso_x is not None:
-        payload["iso_x"] = np.array(calib.iso_x, dtype=object)
-        payload["iso_y"] = np.array(calib.iso_y, dtype=object)
-    if calib.centroid is not None:
-        payload["centroid"] = np.asarray(calib.centroid)
-        payload["zone_edges"] = np.asarray(calib.zone_edges)
-        payload["iso_x_zone"] = np.array(calib.iso_x_zone, dtype=object)
-        payload["iso_y_zone"] = np.array(calib.iso_y_zone, dtype=object)
-    np.savez(path, **payload)
+def load_train_mat(path: str | None) -> tuple[Array, Array, Array]:
+    mat_path = Path(path) if path else Path("DH_FR1.mat")
+    if not mat_path.exists():
+        alt = Path(__file__).resolve().parent.parent / "data" / "InF_DH_FR1.mat"
+        if alt.exists():
+            mat_path = alt
+    raw = sio.loadmat(str(mat_path), squeeze_me=True)
+    p = np.asarray(raw["p"], dtype=np.float64)
+    d_hat = np.asarray(raw["d_hat"], dtype=np.float64)
+    bs_key = "p_bs" if "p_bs" in raw else "BS_positions"
+    bs = np.asarray(raw[bs_key], dtype=np.float64)
+    if d_hat.shape[0] != 18:
+        d_hat = d_hat.T
+    if bs.shape[0] != 2:
+        bs = bs.T
+    return d_hat, p, bs
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--version", type=str, default=None)
     ap.add_argument("--mat", type=str, default=None)
     args = ap.parse_args()
 
-    version = args.version or _pick_best_from_catalog()
-    if version not in VERSION_REGISTRY:
-        version = PRODUCTION_VERSION
+    d_hat, p, bs = load_train_mat(args.mat)
+    cfg = v30_pipeline_cfg()
+    n = d_hat.shape[1]
+    idx = np.arange(n, dtype=np.int64)
 
-    data = load_dataset(args.mat)
-    d_hat, p, bs = data["d_hat"], data["p"], data["bs"]
-    cfg, extra = _resolve_config(version, d_hat, p, bs)
+    calib = fit_calib_v30(d_hat, p, bs, idx)
+    calib = fit_affine_on_train(d_hat, p, bs, idx, calib, cfg)
+    cv = run_fold_cv(d_hat, p, bs, cfg)
 
-    calib, p_hat, fit_summary = fit_full_and_predict(d_hat, p, bs, cfg)
-    cv_check = run_fold_cv(d_hat, p, bs, cfg)
-
-    out = project_root()
-    config = {
-        "production_version": version,
-        "pipeline": {
-            "loss": cfg.loss,
-            "huber_f_scale": cfg.huber_f_scale,
-            "calib": cfg.calib,
-            "gate": False,
-            "weight_gamma": cfg.weight_gamma,
-            "asym_pos_weight": cfg.asym_pos_weight,
-            "top_k": cfg.top_k,
-            "pos_blend_weight": cfg.pos_blend_weight,
-            "pos_refine_affine": cfg.pos_refine_affine,
-            "quantile_tau": cfg.quantile_tau,
-        },
-        "calib": calib.to_dict(),
-        "cv_oof_rmse_m": cv_check["oof_position"]["rmse_m"],
-        "train_fit_rmse_m": fit_summary.get("train_fit", {}).get("rmse_m"),
-        "tuning": extra,
+    bundle = calib.mlp_bundle
+    assert bundle is not None
+    meta = {
+        "in_mean": bundle.in_mean.tolist(),
+        "in_std": bundle.in_std.tolist(),
+        "hidden": bundle.hidden,
+        "dropout": bundle.dropout,
     }
-    (out / "config.json").write_text(
-        json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
+    out = Path(__file__).resolve().parent
+    save_model_bundle(
+        out / "model_mlp.pt",
+        calib,
+        cfg,
+        state_dict=bundle.state_dict,
+        meta=meta,
     )
-    _save_calib_npz(out / "model_calib.npz", calib)
-    if calib.mlp_bundle is not None:
-        _save_mlp_pt(out / "model_mlp.pt", calib)
-    if calib.pos_bundle is not None:
-        _save_pos_pt(out / "model_pos.pt", calib)
 
-    pred_path = out / "outputs" / f"{version}_train700_predictions.csv"
-    pred_path.parent.mkdir(parents=True, exist_ok=True)
-    import pandas as pd
+    p_hat = M.localize_batch(d_hat, bs, calib, cfg)
+    train_rmse = float(np.sqrt(np.mean(np.hypot(p[0] - p_hat[0], p[1] - p_hat[1]) ** 2)))
 
-    df = pd.DataFrame({"pred_x": p_hat[0], "pred_y": p_hat[1], "true_x": p[0], "true_y": p[1]})
-    if data["indices"] is not None:
-        df.insert(0, "index", data["indices"])
-    df.to_csv(pred_path, index=False, encoding="utf-8-sig")
-
-    print(f"train.py done version={version}")
-    print(f"  CV OOF RMSE = {config['cv_oof_rmse_m']:.3f} m")
-    print(f"  train-fit RMSE = {config['train_fit_rmse_m']:.3f} m")
-    print(f"  saved config.json, model_calib.npz")
-    if calib.mlp_bundle is not None:
-        print(f"  saved model_mlp.pt")
+    print(f"train.py done version={PRODUCTION_VERSION}")
+    print(f"  CV OOF RMSE = {cv['oof_position']['rmse_m']:.3f} m")
+    print(f"  train-fit RMSE = {train_rmse:.3f} m")
+    print(f"  saved model_mlp.pt (pipeline + calib bundled)")
 
 
 if __name__ == "__main__":
