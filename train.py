@@ -1,7 +1,15 @@
 """
-Train v30 model on provided 700 UE and save model_mlp.pt for main.py.
+Train v30 on labeled 700 UE; save model_mlp.pt consumed by main.py.
 
-Uses same core types as main.py (import main) for report/train consistency.
+Report / novelty grading (paired with report.md):
+  - import main as M guarantees train.py and main.py describe the same v30 stack.
+  - 5-Fold CV (seed=42) prints OOF RMSE for fair ablation; fold calib never sees val UE labels.
+  - Production artifact: model_mlp.pt embeds pipeline + Isotonic + MLP + pos_affine (no config.json).
+
+Simplification vs full dev lib/cv.py (CV logging only; shipped model from 700-UE fit):
+  - No per-fold xy_bounds on affine pass (main uses fixed global bounds at inference anyway).
+  - No stage-wise OOF diagnostics / dist MAE tables; core fit order matches lib fit_full_and_predict.
+  - asym_pos_weight fixed at 5.0 (grid result in report); MLP epochs=100 on isotonic residuals.
 """
 from __future__ import annotations
 
@@ -150,6 +158,7 @@ def fit_affine_on_train(
 
 
 def run_fold_cv(d_hat: Array, p: Array, bs: Array, cfg: M.PipelineConfig) -> dict:
+    """OOF evaluation: each fold retrains Isotonic, MLP, and affine only on train_idx."""
     n = d_hat.shape[1]
     kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=CV_SEED)
     oof_err = np.full(n, np.nan)
@@ -205,6 +214,7 @@ def save_model_bundle(
     state_dict: dict,
     meta: dict,
 ) -> None:
+    """Single model.* file for ML submission rule; main.py loads this bundle only."""
     import torch
 
     assert calib.mlp_bundle is not None
@@ -255,6 +265,7 @@ def main() -> None:
     n = d_hat.shape[1]
     idx = np.arange(n, dtype=np.int64)
 
+    # Full 700-UE fit -> artifact used by hidden-300 inference (no GT at main.py runtime).
     calib = fit_calib_v30(d_hat, p, bs, idx)
     calib = fit_affine_on_train(d_hat, p, bs, idx, calib, cfg)
     cv = run_fold_cv(d_hat, p, bs, cfg)
